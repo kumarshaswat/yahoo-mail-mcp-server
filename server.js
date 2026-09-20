@@ -14,9 +14,95 @@ import { simpleParser } from 'mailparser';
 import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
+import { execFileSync } from 'child_process';
+import crypto from 'crypto';
 
 // Load environment variables from .env file (for local development)
 dotenv.config();
+
+// --- Stateless, signed OAuth tokens ---------------------------------------
+// Access/refresh tokens are small signed JSON blobs (HMAC-SHA256), not
+// server-side session state. That means they remain valid across process
+// restarts (e.g. Render free-tier spinning the service down after
+// inactivity and spinning up a fresh instance), as long as the signing key
+// is stable. We derive the signing key from OAUTH_CLIENT_SECRET, which is
+// already a required, persistent env var, so no new secret needs to be
+// configured. Only the short-lived PKCE authorization code (exchanged
+// within seconds of being issued) still lives in an in-memory Map, which is
+// fine since it isn't expected to survive a restart anyway.
+function base64url(input) {
+    return Buffer.from(input).toString('base64url');
+}
+
+function getTokenSigningSecret() {
+    // Fall back to a fixed string only so the server doesn't crash before
+    // OAuth env vars are configured; tokens can't be trusted until
+    // OAUTH_CLIENT_SECRET is actually set (authenticateMCP already refuses
+    // to enforce auth in that case).
+    return process.env.OAUTH_CLIENT_SECRET || 'unconfigured-dev-secret';
+}
+
+function signAppToken(payload) {
+    const body = base64url(JSON.stringify(payload));
+    const sig = crypto.createHmac('sha256', getTokenSigningSecret()).update(body).digest('base64url');
+    return `${body}.${sig}`;
+}
+
+function verifyAppToken(token, expectedType) {
+    if (typeof token !== 'string' || !token.includes('.')) return null;
+    const [body, sig] = token.split('.');
+    if (!body || !sig) return null;
+
+    const expectedSig = crypto.createHmac('sha256', getTokenSigningSecret()).update(body).digest('base64url');
+    const sigBuf = Buffer.from(sig);
+    const expectedBuf = Buffer.from(expectedSig);
+    if (sigBuf.length !== expectedBuf.length || !crypto.timingSafeEqual(sigBuf, expectedBuf)) {
+        return null;
+    }
+
+    let payload;
+    try {
+        payload = JSON.parse(Buffer.from(body, 'base64url').toString('utf8'));
+    } catch {
+        return null;
+    }
+
+    if (typeof payload.exp === 'number' && Date.now() > payload.exp) {
+        return null; // expired
+    }
+    if (expectedType && payload.type !== expectedType) {
+        return null;
+    }
+    return payload;
+}
+
+const ACCESS_TOKEN_TTL_MS = 60 * 60 * 1000;             // 1 hour, matches expires_in below
+const REFRESH_TOKEN_TTL_MS = 90 * 24 * 60 * 60 * 1000;  // 90 days, sliding (reissued on each use)
+
+// On macOS, prefer a password stored in the login Keychain over a plaintext
+// .env value. This only fills in YAHOO_APP_PASSWORD when it isn't already
+// set by the environment, so Docker/Render/Windows deployments that inject
+// a real env var are untouched.
+const KEYCHAIN_SERVICE = 'yahoo-mail-mcp';
+if (process.platform === 'darwin' && !process.env.YAHOO_APP_PASSWORD) {
+    try {
+        const account = process.env.YAHOO_EMAIL || '';
+        const pw = execFileSync(
+            'security',
+            ['find-generic-password', '-s', KEYCHAIN_SERVICE, '-a', account, '-w'],
+            { encoding: 'utf8' }
+        ).trim();
+        if (pw) {
+            process.env.YAHOO_APP_PASSWORD = pw;
+            console.error('[Server] Loaded Yahoo app password from macOS Keychain.');
+        }
+    } catch (err) {
+        console.error(
+            `[Server] No Keychain entry found for service "${KEYCHAIN_SERVICE}" / account "${process.env.YAHOO_EMAIL || '(unset)'}". ` +
+            'Run: security add-generic-password -s yahoo-mail-mcp -a you@yahoo.com -w "yourapppassword" -U'
+        );
+    }
+}
 
 class YahooMailMCPServer {
     constructor() {
@@ -35,12 +121,14 @@ class YahooMailMCPServer {
         // Store active SSE transports (for routing messages)
         this.transports = new Map();
 
-        // Store valid OAuth access tokens (in-memory)
-        // In production, use Redis or a database with TTL
-        this.validTokens = new Set();
+        // Access/refresh tokens are now self-contained signed tokens (see
+        // signAppToken/verifyAppToken above) rather than an in-memory set,
+        // so they survive process restarts. Nothing to store here anymore.
 
-        // Store authorization codes for OAuth authorization code flow
-        // In production, use Redis with short TTL (60 seconds)
+        // Store authorization codes for OAuth authorization code flow.
+        // This is still in-memory and short-lived (the code is exchanged
+        // for a token within seconds), so it does not need to survive a
+        // restart the way access/refresh tokens do.
         this.authCodes = new Map();
 
         this.setupToolHandlers();
@@ -1330,8 +1418,10 @@ class YahooMailMCPServer {
 
             const token = authHeader.substring(7); // Remove 'Bearer ' prefix
 
-            // Validate token (check if it's in our valid tokens set)
-            if (!this.validTokens || !this.validTokens.has(token)) {
+            // Validate token: verify signature + type + expiry. This works
+            // even right after a fresh deploy/restart since it doesn't rely
+            // on any in-memory state.
+            if (!verifyAppToken(token, 'access')) {
                 console.error('[Auth] Invalid or expired access token');
                 return res.status(401).json({
                     error: 'invalid_token',
@@ -1353,7 +1443,7 @@ class YahooMailMCPServer {
                 issuer: baseUrl,
                 authorization_endpoint: `${baseUrl}/oauth/authorize`,
                 token_endpoint: `${baseUrl}/oauth/token`,
-                grant_types_supported: ['authorization_code', 'client_credentials'],
+                grant_types_supported: ['authorization_code', 'client_credentials', 'refresh_token'],
                 response_types_supported: ['code'],
                 token_endpoint_auth_methods_supported: ['client_secret_basic', 'client_secret_post'],
                 code_challenge_methods_supported: ['S256'],
@@ -1528,33 +1618,74 @@ class YahooMailMCPServer {
                 // Delete used auth code (one-time use)
                 this.authCodes.delete(code);
 
-                // Generate access token
-                const accessToken = Buffer.from(`${reqClientId}:${Date.now()}:${Math.random()}`).toString('base64');
-                this.validTokens.add(accessToken);
+                // Generate a signed access token + refresh token. Both
+                // survive a server restart since they're just verified by
+                // signature/expiry rather than looked up in memory.
+                const now = Date.now();
+                const accessToken = signAppToken({ sub: reqClientId, type: 'access', iat: now, exp: now + ACCESS_TOKEN_TTL_MS });
+                const refreshToken = signAppToken({ sub: reqClientId, type: 'refresh', iat: now, exp: now + REFRESH_TOKEN_TTL_MS, scope: authData.scope || 'mcp' });
 
-                console.error('[OAuth] Access token generated from authorization code');
+                console.error('[OAuth] Access + refresh token generated from authorization code');
 
                 return res.json({
                     access_token: accessToken,
+                    refresh_token: refreshToken,
                     token_type: 'Bearer',
-                    expires_in: 3600,
+                    expires_in: Math.floor(ACCESS_TOKEN_TTL_MS / 1000),
                     scope: authData.scope || 'mcp'
                 });
             }
 
             // Handle Client Credentials Grant
             if (grantType === 'client_credentials') {
-                // Generate access token
-                const accessToken = Buffer.from(`${clientId}:${Date.now()}:${Math.random()}`).toString('base64');
-                this.validTokens.add(accessToken);
+                const now = Date.now();
+                const accessToken = signAppToken({ sub: clientId, type: 'access', iat: now, exp: now + ACCESS_TOKEN_TTL_MS });
+                const refreshToken = signAppToken({ sub: clientId, type: 'refresh', iat: now, exp: now + REFRESH_TOKEN_TTL_MS, scope: 'mcp' });
 
-                console.error('[OAuth] Access token generated via client credentials');
+                console.error('[OAuth] Access + refresh token generated via client credentials');
 
                 return res.json({
                     access_token: accessToken,
+                    refresh_token: refreshToken,
                     token_type: 'Bearer',
-                    expires_in: 3600,
+                    expires_in: Math.floor(ACCESS_TOKEN_TTL_MS / 1000),
                     scope: 'mcp'
+                });
+            }
+
+            // Handle Refresh Token Grant — this is the piece that was
+            // missing before. Without it, the client had no way to renew
+            // an expired access token and had to run the full interactive
+            // /oauth/authorize flow again every time the 1-hour access
+            // token lapsed (or every time the server restarted and lost
+            // its in-memory token set).
+            if (grantType === 'refresh_token') {
+                const { refresh_token } = req.body;
+                const payload = verifyAppToken(refresh_token, 'refresh');
+
+                if (!payload) {
+                    console.error('[OAuth] Invalid or expired refresh token');
+                    return res.status(400).json({
+                        error: 'invalid_grant',
+                        error_description: 'Invalid or expired refresh token'
+                    });
+                }
+
+                const now = Date.now();
+                const accessToken = signAppToken({ sub: payload.sub, type: 'access', iat: now, exp: now + ACCESS_TOKEN_TTL_MS });
+                // Rotate the refresh token too (sliding window), so a
+                // client that refreshes periodically never actually hits
+                // the 90-day ceiling.
+                const newRefreshToken = signAppToken({ sub: payload.sub, type: 'refresh', iat: now, exp: now + REFRESH_TOKEN_TTL_MS, scope: payload.scope || 'mcp' });
+
+                console.error('[OAuth] Access token renewed via refresh token');
+
+                return res.json({
+                    access_token: accessToken,
+                    refresh_token: newRefreshToken,
+                    token_type: 'Bearer',
+                    expires_in: Math.floor(ACCESS_TOKEN_TTL_MS / 1000),
+                    scope: payload.scope || 'mcp'
                 });
             }
 
@@ -1562,7 +1693,7 @@ class YahooMailMCPServer {
             console.error('[OAuth] Unsupported grant type:', grantType);
             res.status(400).json({
                 error: 'unsupported_grant_type',
-                error_description: 'Supported grant types: authorization_code, client_credentials'
+                error_description: 'Supported grant types: authorization_code, client_credentials, refresh_token'
             });
         });
 
